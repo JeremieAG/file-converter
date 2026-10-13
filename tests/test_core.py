@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import shutil
+import subprocess
+import sys
 import tempfile
 import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
+from file_converter import core
 from file_converter.core import (
     FLAC,
     M4A,
@@ -17,15 +21,16 @@ from file_converter.core import (
     ConversionCancelled,
     ConversionError,
     ConversionOptions,
-    missing_tools,
+    find_ffmpeg,
+    parse_media_info,
 )
 
-from media import audio_packets_md5, decode_errors, ffprobe, make_audio, make_video
+from media import TOOLS_MISSING, audio_packets_md5, decode_errors, ffprobe, make_audio, make_video
 
 DURATION = 10.0
 
 
-@unittest.skipIf(missing_tools(), "ffmpeg/ffprobe introuvables dans le PATH")
+@unittest.skipIf(TOOLS_MISSING, "ffmpeg/ffprobe introuvables dans le PATH")
 class ConversionTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -184,6 +189,152 @@ class ConversionTests(unittest.TestCase):
         with self.assertRaises(ConversionCancelled):
             conversion.run()
         self.assertEqual(list(self.out.iterdir()), [])
+
+    # --- appels système
+
+    @unittest.skipUnless(sys.platform == "win32", "CREATE_NO_WINDOW n'existe que sous Windows")
+    def test_every_subprocess_call_uses_create_no_window(self):
+        real_popen = subprocess.Popen
+        flags = []
+
+        def recording_popen(*args, **kwargs):
+            flags.append(kwargs.get("creationflags", 0))
+            return real_popen(*args, **kwargs)
+
+        with mock.patch.object(core.subprocess, "Popen", recording_popen):
+            self.convert(self.video, MP3)
+        self.assertGreaterEqual(len(flags), 2, "analyse + conversion")
+        self.assertTrue(all(f & subprocess.CREATE_NO_WINDOW for f in flags), flags)
+
+    def test_probe_reads_duration_and_codec_without_ffprobe(self):
+        info = core.probe(self.video)
+        self.assertAlmostEqual(info.duration, DURATION, delta=0.05)
+        self.assertEqual(info.audio_codec, "aac")
+        self.assertFalse(core.probe(self.silent_video).has_audio)
+
+
+# Sorties réelles de « ffmpeg -hide_banner -i … » (ffmpeg 9.0).
+MP4_AAC = """\
+Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'test.mp4':
+  Metadata:
+    major_brand     : isom
+    encoder         : Lavf63.1.102
+  Duration: 00:00:10.00, start: 0.000000, bitrate: 123 kb/s
+  Stream #0:0[0x1](und): Video: h264 (High) (avc1 / 0x31637661), yuv420p(progressive), 640x360, 25 fps (default)
+    Metadata:
+      handler_name    : VideoHandler
+  Stream #0:1[0x2](und): Audio: aac (LC) (mp4a / 0x6134706D), 44100 Hz, mono, fltp, 69 kb/s (default)
+    Metadata:
+      handler_name    : SoundHandler
+At least one output file must be specified
+"""
+
+MKV_MP3_WITH_TRAP_TAG = """\
+Input #0, matroska,webm, from 'a.mkv':
+  Metadata:
+    title           : Duration: 99:00:00.00 piège
+    ENCODER         : Lavf63.1.102
+  Duration: 00:00:03.03, start: 0.000000, bitrate: 111 kb/s
+  Stream #0:0: Video: h264 (High 4:4:4 Predictive), yuv444p(tv, progressive), 320x240, 25 fps
+    Metadata:
+      DURATION        : 00:00:03.000000000
+  Stream #0:1: Audio: mp3 (mp3float), 44100 Hz, mono, fltp, 64 kb/s
+    Metadata:
+      DURATION        : 00:00:03.025000000
+At least one output file must be specified
+"""
+
+TS_TWO_AUDIO_TRACKS = """\
+Input #0, mpegts, from 'multi.ts':
+  Duration: 00:00:03.02, start: 1.416778, bitrate: 915 kb/s
+  Program 1
+    Metadata:
+      service_name    : Service01
+  Stream #0:0[0x100]: Video: mpeg2video (Main) ([2][0][0][0] / 0x0002), yuv420p(tv, progressive), 320x240
+  Stream #0:2[0x102]: Audio: aac (LC) ([15][0][0][0] / 0x000F), 44100 Hz, mono, fltp, 71 kb/s
+  Stream #0:1[0x101]: Audio: mp2 (mp3float) ([3][0][0][0] / 0x0003), 44100 Hz, mono, fltp, 384 kb/s
+At least one output file must be specified
+"""
+
+VIDEO_ONLY_UNKNOWN_DURATION = """\
+Input #0, h264, from 'raw.h264':
+  Duration: N/A, bitrate: N/A
+  Stream #0:0: Video: h264 (High), yuv420p(progressive), 320x240, 25 fps, 25 tbr, 1200k tbn
+At least one output file must be specified
+"""
+
+
+class ParseMediaInfoTests(unittest.TestCase):
+    def test_mp4_with_aac(self):
+        info = parse_media_info(MP4_AAC)
+        self.assertEqual(info.duration, 10.0)
+        self.assertTrue(info.has_audio)
+        self.assertEqual(info.audio_codec, "aac")
+
+    def test_metadata_containing_duration_is_ignored(self):
+        info = parse_media_info(MKV_MP3_WITH_TRAP_TAG)
+        self.assertAlmostEqual(info.duration, 3.03)
+        self.assertEqual(info.audio_codec, "mp3")
+
+    def test_first_audio_track_is_the_lowest_index(self):
+        # -map 0:a:0 prend la piste #0:1 (mp2), même si #0:2 est listée avant.
+        self.assertEqual(parse_media_info(TS_TWO_AUDIO_TRACKS).audio_codec, "mp2")
+
+    def test_no_audio_and_unknown_duration(self):
+        info = parse_media_info(VIDEO_ONLY_UNKNOWN_DURATION)
+        self.assertIsNone(info.duration)
+        self.assertFalse(info.has_audio)
+        self.assertIsNone(info.audio_codec)
+
+    def test_long_duration(self):
+        info = parse_media_info("Input #0, wav, from 'x.wav':\n  Duration: 12:34:56.78, bitrate: 1411 kb/s\n")
+        self.assertAlmostEqual(info.duration, 12 * 3600 + 34 * 60 + 56.78)
+
+
+class FindFfmpegTests(unittest.TestCase):
+    """Ordre de recherche : à côté de l'exécutable empaqueté, puis _internal, puis le PATH."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.app_dir = Path(tmp.name)
+        self.internal = self.app_dir / "_internal"
+        self.internal.mkdir()
+        self.path_ffmpeg = str(self.app_dir / "ailleurs" / "ffmpeg.exe")
+
+    def find(self, frozen=True):
+        patches = [mock.patch.object(core.shutil, "which", return_value=self.path_ffmpeg)]
+        if frozen:
+            patches += [
+                mock.patch.object(sys, "frozen", True, create=True),
+                mock.patch.object(sys, "executable", str(self.app_dir / "FileConverter.exe")),
+                mock.patch.object(sys, "_MEIPASS", str(self.internal), create=True),
+            ]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        return find_ffmpeg()
+
+    def touch(self, directory: Path) -> str:
+        path = directory / core.FFMPEG_EXECUTABLE
+        path.write_bytes(b"")
+        return str(path)
+
+    def test_next_to_executable_wins_over_path(self):
+        expected = self.touch(self.app_dir)
+        self.touch(self.internal)
+        self.assertEqual(self.find(), expected)
+
+    def test_internal_dir_when_not_next_to_executable(self):
+        expected = self.touch(self.internal)
+        self.assertEqual(self.find(), expected)
+
+    def test_falls_back_to_path(self):
+        self.assertEqual(self.find(), self.path_ffmpeg)
+
+    def test_not_frozen_uses_path_only(self):
+        self.touch(self.app_dir)
+        self.assertEqual(self.find(frozen=False), self.path_ffmpeg)
 
 
 if __name__ == "__main__":

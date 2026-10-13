@@ -3,8 +3,13 @@
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 from pathlib import Path
+
+# L'application n'a besoin que de ffmpeg ; les tests utilisent aussi ffprobe pour vérifier
+# les fichiers produits.
+TOOLS_MISSING = shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None
 
 
 def ffmpeg(*args: str) -> None:

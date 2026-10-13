@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import os
+import sys
 import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -12,11 +14,12 @@ from PySide6.QtCore import QMimeData, QPointF, Qt, QUrl
 from PySide6.QtGui import QDropEvent
 from PySide6.QtWidgets import QApplication
 
-from file_converter.core import FLAC, MP3, ConversionOptions, missing_tools
+from file_converter import app as app_module
+from file_converter.core import FLAC, MP3, ConversionOptions
 from file_converter.ui import MainWindow, State
 from file_converter.worker import ConversionWorker
 
-from media import ffprobe, make_audio, make_video
+from media import TOOLS_MISSING, ffprobe, make_audio, make_video
 
 app = QApplication.instance() or QApplication([])
 
@@ -31,7 +34,29 @@ def wait_until(predicate, timeout=60.0):
     app.processEvents()
 
 
-@unittest.skipIf(missing_tools(), "ffmpeg/ffprobe introuvables dans le PATH")
+class StartupTests(unittest.TestCase):
+    """Message affiché au démarrage quand ffmpeg est introuvable."""
+
+    def run_main_without_ffmpeg(self, frozen: bool):
+        with mock.patch.object(app_module, "find_ffmpeg", return_value=None), \
+                mock.patch.object(sys, "frozen", frozen, create=True), \
+                mock.patch.object(app_module.QMessageBox, "critical") as critical:
+            code = app_module.main()
+        self.assertEqual(code, 1)
+        critical.assert_called_once()
+        return critical.call_args.args[2]
+
+    def test_installed_app_asks_to_reinstall(self):
+        message = self.run_main_without_ffmpeg(frozen=True)
+        self.assertIn("ffmpeg.exe est introuvable", message)
+        self.assertIn("réinstallez l'application", message)
+
+    def test_source_run_explains_how_to_install_ffmpeg(self):
+        message = self.run_main_without_ffmpeg(frozen=False)
+        self.assertIn("winget install Gyan.FFmpeg", message)
+
+
+@unittest.skipIf(TOOLS_MISSING, "ffmpeg/ffprobe introuvables dans le PATH")
 class UiTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

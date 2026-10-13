@@ -1,9 +1,9 @@
-"""Logique de conversion ffmpeg/ffprobe, indépendante de l'interface graphique."""
+"""Logique de conversion ffmpeg, indépendante de l'interface graphique."""
 
 from __future__ import annotations
 
 import itertools
-import json
+import re
 import shutil
 import subprocess
 import sys
@@ -13,10 +13,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable
 
-# Sous Windows, évite qu'une console s'ouvre à chaque appel quand l'app tourne via pythonw.
+# Sous Windows, aucun appel à ffmpeg ne doit ouvrir de fenêtre de console : l'application
+# empaquetée n'en a pas, et Windows en créerait une pour chaque processus console lancé.
 _POPEN_FLAGS = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
-REQUIRED_TOOLS = ("ffmpeg", "ffprobe")
+FFMPEG_EXECUTABLE = "ffmpeg.exe" if sys.platform == "win32" else "ffmpeg"
 PROBE_TIMEOUT_S = 60
 
 
@@ -83,19 +84,64 @@ class ConversionResult:
     stream_copied: bool
 
 
-def missing_tools() -> list[str]:
-    """Renvoie les outils requis introuvables dans le PATH."""
-    return [name for name in REQUIRED_TOOLS if shutil.which(name) is None]
+def bundled_dirs() -> list[Path]:
+    """Dossiers où chercher un ffmpeg livré avec l'application, par ordre de priorité.
+
+    Une fois empaquetée avec PyInstaller (sys.frozen), ffmpeg est livré à côté de
+    l'exécutable ; le dossier interne de PyInstaller (sys._MEIPASS, « _internal » en mode
+    onedir) est aussi accepté. En développement, il n'y a pas de ffmpeg livré.
+    """
+    if not getattr(sys, "frozen", False):
+        return []
+    dirs = [Path(sys.executable).resolve().parent]
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        dirs.append(Path(meipass))
+    return dirs
 
 
-def probe(path: Path) -> MediaInfo:
-    """Lit la durée et la première piste audio d'un fichier avec ffprobe."""
-    cmd = [
-        "ffprobe", "-v", "error",
-        "-print_format", "json",
-        "-show_entries", "format=duration:stream=codec_type,codec_name,duration",
-        str(path),
-    ]
+def find_ffmpeg() -> str | None:
+    """Chemin de ffmpeg : celui livré avec l'application en priorité, sinon celui du PATH."""
+    for directory in bundled_dirs():
+        candidate = directory / FFMPEG_EXECUTABLE
+        if candidate.is_file():
+            return str(candidate)
+    return shutil.which("ffmpeg")
+
+
+def _require_ffmpeg() -> str:
+    ffmpeg = find_ffmpeg()
+    if ffmpeg is None:
+        raise ConversionError("ffmpeg est introuvable (ni à côté de l'application, ni dans le PATH).")
+    return ffmpeg
+
+
+# Sans fichier de sortie, « ffmpeg -i fichier » décrit l'entrée sur stderr puis s'arrête.
+# La ligne « Duration: » de l'entrée est indentée de deux espaces ; les métadonnées le sont
+# de quatre, ce qui évite de confondre un tag dont la valeur contiendrait « Duration: ».
+_INPUT_RE = re.compile(r"^Input #0, ", re.MULTILINE)
+_DURATION_RE = re.compile(r"^  Duration: (\d+):(\d{2}):(\d{2}(?:\.\d+)?)", re.MULTILINE)
+_AUDIO_STREAM_RE = re.compile(r"^\s*Stream #0:(\d+)\S*: Audio: ([^\s,]+)", re.MULTILINE)
+
+
+def parse_media_info(ffmpeg_output: str) -> MediaInfo:
+    """Extrait la durée et le codec de la première piste audio de la sortie de « ffmpeg -i »."""
+    duration = None
+    if match := _DURATION_RE.search(ffmpeg_output):
+        hours, minutes, seconds = match.groups()
+        duration = int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+    audio_streams = sorted((int(index), codec) for index, codec in _AUDIO_STREAM_RE.findall(ffmpeg_output))
+    return MediaInfo(
+        duration=duration if duration else None,
+        has_audio=bool(audio_streams),
+        # -map 0:a:0 sélectionne la piste audio de plus petit index.
+        audio_codec=audio_streams[0][1] if audio_streams else None,
+    )
+
+
+def probe(path: Path, ffmpeg: str | None = None) -> MediaInfo:
+    """Lit la durée et la première piste audio d'un fichier, sans ffprobe."""
+    cmd = [ffmpeg or _require_ffmpeg(), "-hide_banner", "-nostdin", "-i", str(path)]
     try:
         proc = subprocess.run(
             cmd,
@@ -108,27 +154,15 @@ def probe(path: Path) -> MediaInfo:
             creationflags=_POPEN_FLAGS,
         )
     except FileNotFoundError:
-        raise ConversionError("ffprobe est introuvable dans le PATH.") from None
+        raise ConversionError("ffmpeg est introuvable.") from None
     except subprocess.TimeoutExpired:
-        raise ConversionError("ffprobe ne répond pas (délai dépassé).") from None
+        raise ConversionError("ffmpeg ne répond pas pendant l'analyse du fichier (délai dépassé).") from None
 
-    if proc.returncode != 0:
+    # Le code de sortie est toujours non nul (aucune sortie demandée) : seule la présence
+    # de la description de l'entrée indique que le fichier a pu être ouvert.
+    if not _INPUT_RE.search(proc.stderr):
         raise ConversionError(_describe_ffmpeg_error(proc.stderr.splitlines(), probing=True))
-    try:
-        data = json.loads(proc.stdout or "{}")
-    except json.JSONDecodeError:
-        raise ConversionError("Réponse de ffprobe illisible.") from None
-
-    audio_streams = [s for s in data.get("streams", []) if s.get("codec_type") == "audio"]
-    first_audio = audio_streams[0] if audio_streams else {}
-    duration = _parse_duration(data.get("format", {}).get("duration"))
-    if duration is None:
-        duration = _parse_duration(first_audio.get("duration"))
-    return MediaInfo(
-        duration=duration,
-        has_audio=bool(audio_streams),
-        audio_codec=first_audio.get("codec_name"),
-    )
+    return parse_media_info(proc.stderr)
 
 
 def reserve_output_path(directory: Path, stem: str, extension: str) -> Path:
@@ -151,11 +185,11 @@ def reserve_output_path(directory: Path, stem: str, extension: str) -> Path:
 
 
 def build_command(
-    source: Path, output: Path, options: ConversionOptions, info: MediaInfo
+    ffmpeg: str, source: Path, output: Path, options: ConversionOptions, info: MediaInfo
 ) -> tuple[list[str], bool]:
     """Construit la ligne de commande ffmpeg. Renvoie (commande, copie_sans_réencodage)."""
     cmd = [
-        "ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "error",
+        ffmpeg, "-hide_banner", "-nostdin", "-loglevel", "error",
         # Écrase uniquement le fichier vide réservé par reserve_output_path().
         "-y",
         "-i", str(source),
@@ -212,7 +246,8 @@ class Conversion:
         if not self.source.is_file():
             raise ConversionError("Fichier introuvable.")
 
-        info = probe(self.source)
+        ffmpeg = _require_ffmpeg()
+        info = probe(self.source, ffmpeg)
         if not info.has_audio:
             raise ConversionError("Ce fichier ne contient aucune piste audio.")
         self._raise_if_cancelled()
@@ -225,7 +260,7 @@ class Conversion:
                 f"Impossible de créer le fichier de sortie dans « {output_dir} » : {exc.strerror or exc}"
             ) from None
 
-        cmd, stream_copied = build_command(self.source, output, self.options, info)
+        cmd, stream_copied = build_command(ffmpeg, self.source, output, self.options, info)
         try:
             self._run_ffmpeg(cmd, info.duration, report)
         except BaseException:
@@ -252,7 +287,7 @@ class Conversion:
                     creationflags=_POPEN_FLAGS,
                 )
             except FileNotFoundError:
-                raise ConversionError("ffmpeg est introuvable dans le PATH.") from None
+                raise ConversionError("ffmpeg est introuvable.") from None
             self._process = process
 
         # stderr est lu dans un thread à part pour qu'un flot d'erreurs ne bloque pas ffmpeg
@@ -287,14 +322,6 @@ class Conversion:
         self._raise_if_cancelled()
         if process.returncode != 0:
             raise ConversionError(_describe_ffmpeg_error(stderr_tail))
-
-
-def _parse_duration(value: object) -> float | None:
-    try:
-        duration = float(value)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
-        return None
-    return duration if duration > 0 else None
 
 
 _KNOWN_ERRORS = (
